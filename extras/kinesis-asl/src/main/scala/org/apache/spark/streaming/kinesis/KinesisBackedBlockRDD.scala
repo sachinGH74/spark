@@ -27,13 +27,6 @@ object SequenceNumberRanges {
     new SequenceNumberRanges(ranges.toArray)
   }
 
-  /*
-  def toArray(sequenceRanges: Seq[SequenceNumberRange]): Array[SequenceNumberRanges] = {
-    sequenceRanges.map { range =>
-      SequenceNumberRanges(range)
-    }.toArray
-  }
-  */
   def empty: SequenceNumberRanges = {
     new SequenceNumberRanges(Array.empty)
   }

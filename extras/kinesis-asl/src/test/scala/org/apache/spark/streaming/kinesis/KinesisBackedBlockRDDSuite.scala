@@ -17,11 +17,12 @@ class KinesisBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
   private val streamName = "TDTest"
   private val regionId = "us-east-1"
   private val endPointUrl = "https://kinesis.us-east-1.amazonaws.com"
+  /*
   private val proxy = new KinesisProxy(
     new DefaultAWSCredentialsProviderChain(), endPointUrl, regionId)
   private val shardInfo = proxy.getAllShards(streamName)
   require(shardInfo.size > 1, "Need a stream with more than 1 shard")
-
+  */
   private val kinesisClient = new AmazonKinesisClient(new DefaultAWSCredentialsProviderChain())
   kinesisClient.setEndpoint(endPointUrl)
 
@@ -43,6 +44,7 @@ class KinesisBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
 
     shardIdToDataAndSeqNumbers = pushData(testData)
     assert(shardIdToDataAndSeqNumbers.size > 1, "Need at least 2 shards to test")
+
     shardIds = shardIdToDataAndSeqNumbers.keySet.toSeq
     shardIdToData = shardIdToDataAndSeqNumbers.mapValues { _.map { _._1 }}
     shardIdToSeqNumbers = shardIdToDataAndSeqNumbers.mapValues { _.map { _._2 }}

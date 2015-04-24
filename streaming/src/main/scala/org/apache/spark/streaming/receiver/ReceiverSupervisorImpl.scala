@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.Await
 
 import com.google.common.base.Throwables
 import org.apache.hadoop.conf.Configuration
@@ -145,7 +146,7 @@ private[streaming] class ReceiverSupervisorImpl(
     val blockStoreResult = receivedBlockHandler.storeBlock(blockId, receivedBlock)
     logDebug(s"Pushed block $blockId in ${(System.currentTimeMillis - time)} ms")
 
-    val blockInfo = ReceivedBlockInfo(streamId, numRecords, blockStoreResult)
+    val blockInfo = ReceivedBlockInfo(streamId, numRecords, blockStoreResult, metadataOption)
     trackerEndpoint.askWithReply[Boolean](AddBlock(blockInfo))
     logDebug(s"Reported block $blockId")
   }

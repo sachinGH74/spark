@@ -73,7 +73,7 @@ private[streaming] class ReceivedBlockTracker(
   private val logManagerOption = createLogManager()
 
   private var lastAllocatedBatchTime: Time = null
-
+  println("checkpoint dir specified as " + checkpointDirOption)
   // Recover block information from write ahead logs
   recoverFromWriteAheadLogs()
 
@@ -82,8 +82,8 @@ private[streaming] class ReceivedBlockTracker(
     try {
       writeToLog(BlockAdditionEvent(receivedBlockInfo))
       getReceivedBlockQueue(receivedBlockInfo.streamId) += receivedBlockInfo
-      logDebug(s"Stream ${receivedBlockInfo.streamId} received " +
-        s"block ${receivedBlockInfo.blockStoreResult.blockId}")
+      println(s"Stream ${receivedBlockInfo.streamId} received " +
+        s"block ${receivedBlockInfo}")
       true
     } catch {
       case e: Exception =>
@@ -170,7 +170,7 @@ private[streaming] class ReceivedBlockTracker(
   private def recoverFromWriteAheadLogs(): Unit = synchronized {
     // Insert the recovered block information
     def insertAddedBlock(receivedBlockInfo: ReceivedBlockInfo) {
-      logTrace(s"Recovery: Inserting added block $receivedBlockInfo")
+      println(s"Recovery: Inserting added block $receivedBlockInfo")
       getReceivedBlockQueue(receivedBlockInfo.streamId) += receivedBlockInfo
     }
 
@@ -191,7 +191,7 @@ private[streaming] class ReceivedBlockTracker(
     }
 
     logManagerOption.foreach { logManager =>
-      logInfo(s"Recovering from write ahead logs in ${checkpointDirOption.get}")
+      println(s"Recovering from write ahead logs in ${checkpointDirOption.get}")
       logManager.readFromLog().foreach { byteBuffer =>
         logTrace("Recovering record " + byteBuffer)
         Utils.deserialize[ReceivedBlockTrackerLogEvent](byteBuffer.array) match {

@@ -28,7 +28,7 @@
   <groupId>org.apache.spark</groupId>
   <artifactId>spark-streaming-kinesis-asl_2.10</artifactId>
   <packaging>jar</packaging>
-  <name>Spark Kinesis Integration</name>
+  <name>Spark Project Extra Kinesis </name>
 
   <properties>
     <sbt.project.name>kinesis-asl</sbt.project.name>

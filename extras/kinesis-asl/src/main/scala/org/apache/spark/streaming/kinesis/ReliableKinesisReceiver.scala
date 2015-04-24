@@ -19,11 +19,10 @@ package org.apache.spark.streaming.kinesis
 import java.net.InetAddress
 import java.util.UUID
 
-import org.apache.spark.Logging
-import org.apache.spark.storage.StorageLevel
+import org.apache.spark.{SparkEnv, Logging}
+import org.apache.spark.storage.{StreamBlockId, StorageLevel}
 import org.apache.spark.streaming.Duration
-import org.apache.spark.streaming.receiver.Receiver
-import org.apache.spark.util.Utils
+import org.apache.spark.streaming.receiver.{BlockGeneratorListener, BlockGenerator, Receiver}
 
 import com.amazonaws.auth.AWSCredentialsProvider
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain
@@ -32,6 +31,9 @@ import com.amazonaws.services.kinesis.clientlibrary.interfaces.IRecordProcessorF
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.KinesisClientLibConfiguration
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.Worker
+
+import scala.collection.mutable
+import scala.util.control.NonFatal
 
 /**
  * Custom AWS Kinesis-specific implementation of Spark Streaming's Receiver.
@@ -60,10 +62,11 @@ import com.amazonaws.services.kinesis.clientlibrary.lib.worker.Worker
  *                                 the tip of the stream (InitialPositionInStream.LATEST).
  * @param storageLevel Storage level to use for storing the received objects
  */
-private[kinesis] class KinesisReceiver(
-    appName: String,
-    streamName: String,
+private[kinesis] class ReliableKinesisReceiver(
+
+    val streamName: String,
     endpointUrl: String,
+    checkpointAppName: String,
     checkpointInterval: Duration,
     initialPositionInStream: InitialPositionInStream,
     storageLevel: StorageLevel)
@@ -78,7 +81,7 @@ private[kinesis] class KinesisReceiver(
    *  workerId should be based on the ip address of the actual Spark Worker where this code runs
    *   (not the Driver's ip address.)
    */
-  var workerId: String = null
+  private var workerId: String = null
 
   /*
    * This impl uses the DefaultAWSCredentialsProviderChain and searches for credentials 
@@ -89,10 +92,10 @@ private[kinesis] class KinesisReceiver(
    *   AWS SDKs and the AWS CLI
    * Instance profile credentials delivered through the Amazon EC2 metadata service
    */
-  var credentialsProvider: AWSCredentialsProvider = null
+  private var credentialsProvider: AWSCredentialsProvider = null
 
   /* KCL config instance. */
-  var kinesisClientLibConfiguration: KinesisClientLibConfiguration = null
+  private var kinesisClientLibConfiguration: KinesisClientLibConfiguration = null
 
   /*
    *  RecordProcessorFactory creates impls of IRecordProcessor.
@@ -100,7 +103,7 @@ private[kinesis] class KinesisReceiver(
    *    IRecordProcessor.processRecords() method.
    *  We're using our custom KinesisRecordProcessor in this case.
    */
-  var recordProcessorFactory: IRecordProcessorFactory = null
+  private var recordProcessorFactory: IRecordProcessorFactory = null
 
   /*
    * Create a Kinesis Worker.
@@ -109,7 +112,17 @@ private[kinesis] class KinesisReceiver(
    * A Kinesis Worker can process 1..* shards from the given stream - each with its 
    *   own RecordProcessor.
    */
-  var worker: Worker = null
+  private var worker: Worker = null
+  private var workerThread: Thread = null
+
+  /** BlockGenerator used to generates blocks out of Kinesis data */
+  private[kinesis] var blockGenerator: BlockGenerator = null
+
+  private case class MutableSequenceNumberRange(from: String, var to: String)
+  //private val shardIdToSeqNums = new mutable.HashMap[String, MutableSequenceNumberRange]
+  private val seqNumRangesInCurrentBlock = new mutable.ArrayBuffer[SequenceNumberRange]
+
+  private val blockIdToSeqNumRanges = new mutable.HashMap[StreamBlockId, Array[SequenceNumberRange]]
 
   /**
    *  This is called when the KinesisReceiver starts and must be non-blocking.
@@ -117,17 +130,25 @@ private[kinesis] class KinesisReceiver(
    *    method.
    */
   override def onStart() {
-    workerId = Utils.localHostName() + ":" + UUID.randomUUID()
+    blockGenerator =  new BlockGenerator(new GeneratedBlockHandler, streamId, SparkEnv.get.conf)
+    workerId = InetAddress.getLocalHost.getHostAddress() + ":" + UUID.randomUUID()
     credentialsProvider = new DefaultAWSCredentialsProviderChain()
-    kinesisClientLibConfiguration = new KinesisClientLibConfiguration(appName, streamName,
+    kinesisClientLibConfiguration = new KinesisClientLibConfiguration(checkpointAppName, streamName,
       credentialsProvider, workerId).withKinesisEndpoint(endpointUrl)
       .withInitialPositionInStream(initialPositionInStream).withTaskBackoffTimeMillis(500)
     recordProcessorFactory = new IRecordProcessorFactory {
-      override def createProcessor: IRecordProcessor = new KinesisRecordProcessor(receiver,
+      override def createProcessor: IRecordProcessor = new ReliableKinesisRecordProcessor(receiver,
         workerId, new KinesisCheckpointState(checkpointInterval))
     }
     worker = new Worker(recordProcessorFactory, kinesisClientLibConfiguration)
-    worker.run()
+    workerThread = new Thread() {
+      override def run(): Unit = { worker.run() }
+    }
+
+    blockIdToSeqNumRanges.clear()
+    blockGenerator.start()
+    workerThread.start()
+
     logInfo(s"Started receiver with workerId $workerId")
   }
 
@@ -137,12 +158,85 @@ private[kinesis] class KinesisReceiver(
    *  The KCL will do its best to drain and checkpoint any in-flight records upon shutdown.
    */
   override def onStop() {
-    worker.shutdown()
-    logInfo(s"Shut down receiver with workerId $workerId")
+    if (blockGenerator != null) {
+      blockGenerator.stop()
+      blockGenerator = null
+    }
+    if (worker != null) {
+      worker.shutdown()
+      worker = null
+    }
+
     workerId = null
     credentialsProvider = null
     kinesisClientLibConfiguration = null
     recordProcessorFactory = null
-    worker = null
+    logInfo(s"Shut down receiver with workerId $workerId")
+  }
+
+
+  private def rememberSeqNumRangeOfCurrentBlock(range: SequenceNumberRange): Unit = {
+    // Remember the sequence number range that got added to the block
+    seqNumRangesInCurrentBlock += range
+  }
+
+  /*
+  private def rememberSeqNum(shardId: String, seqNum: String): Unit = {
+    val range = shardIdToSeqNums.getOrElseUpdate(shardId,
+      MutableSequenceNumberRange(seqNum, seqNum))
+    range.to = seqNum
+  }*/
+
+  private def rememberAllSeqNumRangesOfGeneratedBlock(blockId: StreamBlockId): Unit = {
+    blockIdToSeqNumRanges(blockId) = seqNumRangesInCurrentBlock.toArray
+    seqNumRangesInCurrentBlock.clear()
+    logDebug(s"Generated block $blockId has ${ blockIdToSeqNumRanges(blockId).mkString(", ")}")
+  }
+
+  private def storeBlockWithSeqNumRanges(
+      blockId: StreamBlockId, arrayBuffer: mutable.ArrayBuffer[Array[Byte]]): Unit = {
+    val rangesToReport = SequenceNumberRanges(blockIdToSeqNumRanges(blockId))
+    var count = 0
+    var pushed = false
+    var throwable: Throwable = null
+    while (!pushed && count <= 3) {
+      try {
+        store(arrayBuffer, rangesToReport)
+        pushed = true
+      } catch {
+        case NonFatal(th) =>
+          count += 1
+          throwable = th
+      }
+    }
+    blockIdToSeqNumRanges -= blockId
+    if (!pushed) {
+      stop("Error while storing block into Spark", throwable)
+    }
+  }
+
+  /** Class to handle blocks generated by the block generator. */
+  private final class GeneratedBlockHandler extends BlockGeneratorListener {
+
+    def onAddData(data: Any, metadata: Any): Unit = {
+      rememberSeqNumRangeOfCurrentBlock(metadata.asInstanceOf[SequenceNumberRange])
+      /*val (shardId, seqNum) = metadata.asInstanceOf[(String, String)]
+      rememberSeqNum(shardId, seqNum)*/
+    }
+
+    def onGenerateBlock(blockId: StreamBlockId): Unit = {
+      // Remember all the ranges that had gotten added to the block
+      rememberAllSeqNumRangesOfGeneratedBlock(blockId)
+    }
+
+    def onPushBlock(blockId: StreamBlockId, arrayBuffer: mutable.ArrayBuffer[_]): Unit = {
+      // Store block with the associated ranges
+      storeBlockWithSeqNumRanges(blockId,
+        arrayBuffer.asInstanceOf[mutable.ArrayBuffer[Array[Byte]]])
+    }
+
+    def onError(message: String, throwable: Throwable): Unit = {
+      reportError(message, throwable)
+    }
   }
 }
